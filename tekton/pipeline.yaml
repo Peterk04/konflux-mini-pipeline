@@ -1,0 +1,187 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: konflux-mini
+spec:
+  params:
+    - name: git-url
+      type: string
+    - name: git-revision
+      type: string
+      default: main
+    - name: image
+      type: string
+      default: quay.io/peterk04/demo-app
+    - name: severity-threshold
+      type: string
+      default: "0"
+  workspaces:
+    - name: source
+    - name: dockerconfig
+  tasks:
+    # Clone the requested repository revision into the shared source workspace.
+    - name: clone
+      taskRef:
+        resolver: hub
+        params:
+          - name: kind
+            value: task
+          - name: name
+            value: git-clone
+          - name: version
+            value: "0.9"
+      params:
+        - name: url
+          value: $(params.git-url)
+        - name: revision
+          value: $(params.git-revision)
+      workspaces:
+        - name: output
+          workspace: source
+
+    # Build the cloned source with Buildah and push it to Quay.
+    - name: build-push
+      runAfter:
+        - clone
+      taskRef:
+        resolver: hub
+        params:
+          - name: kind
+            value: task
+          - name: name
+            value: buildah
+          - name: version
+            value: "0.9"
+      params:
+        - name: IMAGE
+          value: $(params.image):$(tasks.clone.results.commit)
+        - name: STORAGE_DRIVER
+          value: vfs
+      workspaces:
+        - name: source
+          workspace: source
+        - name: dockerconfig
+          workspace: dockerconfig
+
+    # Generate an SPDX JSON SBOM for the pushed image digest.
+    - name: sbom
+      runAfter:
+        - build-push
+      params:
+        - name: image-ref
+          value: $(params.image)@$(tasks.build-push.results.IMAGE_DIGEST)
+      workspaces:
+        - name: source
+          workspace: source
+      taskSpec:
+        params:
+          - name: image-ref
+            type: string
+        workspaces:
+          - name: source
+        steps:
+          - name: generate
+            image: docker.io/anchore/syft:v1.57.1
+            args:
+              - scan
+              - $(params.image-ref)
+              - -o
+              - table
+              - -o
+              - spdx-json=$(workspaces.source.path)/sbom.spdx.json
+
+    # Ask Clair for a vulnerability report on the pushed image digest.
+    - name: scan
+      runAfter:
+        - sbom
+      params:
+        - name: image-ref
+          value: $(params.image)@$(tasks.build-push.results.IMAGE_DIGEST)
+      workspaces:
+        - name: source
+          workspace: source
+      taskSpec:
+        params:
+          - name: image-ref
+            type: string
+        workspaces:
+          - name: source
+        steps:
+          - name: report
+            image: quay.io/projectquay/clair:4.9.0
+            script: |
+              #!/bin/sh
+              clairctl report --host http://clair.clair.svc.cluster.local:6060 -o json \
+                "$(params.image-ref)" \
+                > "$(workspaces.source.path)/clair-report.json"
+
+    # Count fixable HIGH and CRITICAL findings, failing above the allowed threshold.
+    - name: gate
+      runAfter:
+        - scan
+      workspaces:
+        - name: source
+          workspace: source
+      taskSpec:
+        workspaces:
+          - name: source
+        steps:
+          - name: check-report
+            image: python:3.13-slim
+            script: |
+              #!/usr/bin/env python3
+              import json
+              import sys
+
+              with open("$(workspaces.source.path)/clair-report.json") as f:
+                  report = json.load(f)
+
+              prefix = "message/vnd.clair.map.vulnerability"
+              cvss_map = {}
+              for key, value in report.get("enrichments", {}).items():
+                  if key.startswith(prefix):
+                      cvss_map = value[0]
+                      break
+              high = 0
+              critical = 0
+              for vulnerability_id, vulnerability in report["vulnerabilities"].items():
+                  if not vulnerability["fixed_in_version"]:
+                      continue
+                  severities = [record["baseSeverity"]
+                                for record in cvss_map.get(vulnerability_id, [])]
+                  if "CRITICAL" in severities:
+                      critical += 1
+                  elif "HIGH" in severities:
+                      high += 1
+
+              threshold = int("$(params.severity-threshold)")
+              print(f"HIGH={high} CRITICAL={critical} threshold={threshold}")
+              if high + critical > threshold:
+                  sys.exit(1)
+
+    # Update the Deployment to the immutable digest and wait for its rollout.
+    - name: deploy
+      runAfter:
+        - gate
+      params:
+        - name: image-ref
+          value: $(params.image)@$(tasks.build-push.results.IMAGE_DIGEST)
+      taskSpec:
+        params:
+          - name: image-ref
+            type: string
+        steps:
+          - name: set-image
+            image: registry.k8s.io/kubectl:v1.37.0
+            args:
+              - set
+              - image
+              - deployment/demo-app
+              - app=$(params.image-ref)
+          - name: rollout-status
+            image: registry.k8s.io/kubectl:v1.37.0
+            args:
+              - rollout
+              - status
+              - deployment/demo-app
+              - --timeout=120s
