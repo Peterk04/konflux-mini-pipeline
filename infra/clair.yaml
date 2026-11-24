@@ -1,0 +1,134 @@
+# Clair v4 (combo mode) + PostgreSQL for the Cloud Computing 1 term paper pipeline.
+# Infrastructure set up by Claude (see ai-use.md). Pipeline tasks reach Clair at
+#   http://clair.clair.svc.cluster.local:6060
+# Create the DB password secret first (done once):
+#   kubectl create ns clair
+#   kubectl -n clair create secret generic clair-db --from-literal=password="$(openssl rand -hex 16)"
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: clair
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: clair-db
+  namespace: clair
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: clair-db
+  namespace: clair
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {app: clair-db}
+  template:
+    metadata:
+      labels: {app: clair-db}
+    spec:
+      containers:
+        - name: postgres
+          image: docker.io/library/postgres:16
+          env:
+            - {name: POSTGRES_USER, value: clair}
+            - {name: POSTGRES_DB, value: clair}
+            - name: POSTGRES_PASSWORD
+              valueFrom: {secretKeyRef: {name: clair-db, key: password}}
+            - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
+          ports:
+            - containerPort: 5432
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "clair", "-d", "clair"]
+            periodSeconds: 5
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/postgresql/data}
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: clair-db}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: clair-db
+  namespace: clair
+spec:
+  selector: {app: clair-db}
+  ports:
+    - port: 5432
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: clair-config
+  namespace: clair
+data:
+  config.yaml: |
+    http_listen_addr: ":6060"
+    introspection_addr: ":8089"
+    log_level: info
+    indexer:
+      connstring: "host=clair-db port=5432 user=clair dbname=clair sslmode=disable"
+      migrations: true
+    matcher:
+      connstring: "host=clair-db port=5432 user=clair dbname=clair sslmode=disable"
+      migrations: true
+    notifier:
+      connstring: "host=clair-db port=5432 user=clair dbname=clair sslmode=disable"
+      migrations: true
+    updaters:
+      # Only the distro feeds the demo images need; null would run every feed (slow first load).
+      sets: ["debian", "ubuntu", "alpine", "clair.cvss"]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: clair
+  namespace: clair
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: clair}
+  template:
+    metadata:
+      labels: {app: clair}
+    spec:
+      containers:
+        - name: clair
+          image: quay.io/projectquay/clair:4.9.0
+          env:
+            - {name: CLAIR_MODE, value: combo}
+            - {name: CLAIR_CONF, value: /config/config.yaml}
+            - name: PGPASSWORD   # read by the Postgres driver, keeps the password out of the config
+              valueFrom: {secretKeyRef: {name: clair-db, key: password}}
+          ports:
+            - {containerPort: 6060, name: api}
+            - {containerPort: 8089, name: introspection}
+          readinessProbe:
+            tcpSocket: {port: 6060}
+            periodSeconds: 10
+          volumeMounts:
+            - {name: config, mountPath: /config}
+      volumes:
+        - name: config
+          configMap: {name: clair-config}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: clair
+  namespace: clair
+spec:
+  selector: {app: clair}
+  ports:
+    - {port: 6060, name: api}
+    - {port: 8089, name: introspection}
